@@ -464,6 +464,15 @@ public class PulsarMockBookKeeper extends BookKeeper {
         promiseAfter(steps, addEntryFailures).completeExceptionally(BKException.create(rc));
     }
 
+    /**
+     * Discard every programmed failure so subsequent operations succeed. Tests that inject more failures than
+     * a single operation consumes use this to restore healthy behavior without restarting the mock client.
+     */
+    public synchronized void drainProgrammedFailures() {
+        failures.clear();
+        addEntryFailures.clear();
+    }
+
     private int emptyLedgerAfter = -1;
 
     /**

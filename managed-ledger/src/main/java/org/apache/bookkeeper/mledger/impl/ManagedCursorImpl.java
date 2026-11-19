@@ -2388,7 +2388,7 @@ public class ManagedCursorImpl implements ManagedCursor {
 
             @Override
             public void markDeleteFailed(ManagedLedgerException exception, Object ctx) {
-                if (exception.getCause() instanceof IllegalArgumentException) {
+                if (isAlreadyMarkDeletedFailure(exception)) {
                     // There could be a race condition between calling clear backlog and other mark delete operations.
                     // If we get an exception it means the backlog was already cleared in the meantime.
                     callback.clearBacklogComplete(ctx);
@@ -2397,6 +2397,10 @@ public class ManagedCursorImpl implements ManagedCursor {
                 }
             }
         }, ctx);
+    }
+
+    private static boolean isAlreadyMarkDeletedFailure(ManagedLedgerException exception) {
+        return exception != null && exception.getCause() instanceof IllegalArgumentException;
     }
 
     @Override
@@ -2451,7 +2455,7 @@ public class ManagedCursorImpl implements ManagedCursor {
 
                     @Override
                     public void markDeleteFailed(ManagedLedgerException exception, Object ctx) {
-                        if (exception.getCause() instanceof IllegalArgumentException) {
+                        if (isAlreadyMarkDeletedFailure(exception)) {
                             // There could be a race condition between calling clear backlog and other mark delete
                             // operations.
                             // If we get an exception it means the backlog was already cleared in the meantime.
@@ -4645,22 +4649,32 @@ public class ManagedCursorImpl implements ManagedCursor {
             return;
         }
 
-        isDirty = false;
+        // Keep the cursor marked dirty until the persistence result is known. Clearing the flag before the
+        // asynchronous write completes would drop the only retry path if the write fails: the in-memory
+        // mark-delete position would keep moving forward, while a broker restart could only recover the last
+        // persisted position and redeliver every entry acknowledged in between. A successful write clears the
+        // flag through the mark-delete completion path; a failed write leaves it set for the next flush.
         asyncMarkDelete(lastMarkDeleteEntry.newPosition, lastMarkDeleteEntry.properties, new MarkDeleteCallback() {
             @Override
             public void markDeleteComplete(Object ctx) {
+                isDirty = false;
                 log.debug("Flushed dirty mark-delete position");
             }
 
             @Override
             public void markDeleteFailed(ManagedLedgerException exception, Object ctx) {
                 if (exception.getCause() instanceof MarkDeletingMarkedPosition) {
+                    // The position was already persisted by a concurrent mark-delete, so there is nothing left
+                    // to flush and the cursor must not stay dirty forever.
+                    isDirty = false;
                     // this is not actually a problem, we should not log a stacktrace
                     log.info()
                             .exceptionMessage(exception.getCause())
                             .log("Cannot flush mark-delete position");
                 } else {
-                    log.warn().exception(exception).log("Failed to flush mark-delete position");
+                    // Keep the cursor dirty for the next flush retry.
+                    log.warn().exception(exception).log("Failed to flush mark-delete position,"
+                            + " keeping the cursor dirty for a retry");
                 }
             }
         }, null);

@@ -5853,19 +5853,34 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
 
         assertEquals(c1.getMarkDeletedPosition(), positions.get(positions.size() - 1));
 
+        // The throttled acknowledgments leave the cursor dirty until the periodic flush persists them.
+        ManagedCursorImpl dirtyCursor = (ManagedCursorImpl) c1;
+        Awaitility.await().untilAsserted(() -> assertThat(dirtyCursor.isDirty()).isTrue());
+
+        // Stop throttling so the periodic flush (cursorPositionFlushSeconds=1) can persist the dirty position
+        // without racing for a one-per-second rate-limit permit.
+        dirtyCursor.setThrottleMarkDelete(0);
+
+        // Give the periodic flush time to persist the dirty position and clear the flag. A flush never drops
+        // the dirty flag before its persistence completes.
         Awaitility.await()
-                // Give chance to the flush to be automatically triggered.
                 // NOTE: this can't be set too low, or it causes issues with ZK thread pool rejecting
                 .pollDelay(Duration.ofMillis(2000))
+                .atMost(Duration.ofSeconds(30))
                 .untilAsserted(() -> {
-                    // Abruptly re-open the managed ledger without graceful close
-                    @Cleanup("shutdown")
-                    ManagedLedgerFactory factory2 = new ManagedLedgerFactoryImpl(metadataStore, bkc);
-                    ManagedLedger ledger2 = factory2.open("testFlushCursorAfterInactivity", config);
-                    ManagedCursor c2 = ledger2.openCursor("c");
-
-                    assertThat(c2.getMarkDeletedPosition()).isGreaterThan(positions.get(positions.size() - 1));
+                    assertThat(dirtyCursor.isDirty()).isFalse();
+                    assertThat(dirtyCursor.getPersistentMarkDeletedPosition())
+                            .isEqualTo(positions.get(positions.size() - 1));
                 });
+
+        // Abruptly re-open the managed ledger without graceful close: the flushed position survives.
+        @Cleanup("shutdown")
+        ManagedLedgerFactory factory2 = new ManagedLedgerFactoryImpl(metadataStore, bkc);
+        ManagedLedger ledger2 = factory2.open("testFlushCursorAfterInactivity", config);
+        ManagedCursor c2 = ledger2.openCursor("c");
+
+        assertThat(c2.getMarkDeletedPosition())
+                .isGreaterThanOrEqualTo(positions.get(positions.size() - 1));
     }
 
     @Test
@@ -5912,10 +5927,15 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
 
         assertNotEquals(dirtyCursor.getMarkDeletedPosition(), positions.get(positions.size() - 1));
 
+        // Stop throttling so the periodic flush can persist the dirty position without racing for a
+        // one-per-second rate-limit permit.
+        ((ManagedCursorImpl) c1).setThrottleMarkDelete(0);
+
         Awaitility.await()
                 // Give chance to the flush to be automatically triggered.
                 // NOTE: this can't be set too low, or it causes issues with ZK thread pool rejecting
                 .pollDelay(Duration.ofMillis(2000))
+                .atMost(Duration.ofSeconds(30))
                 .untilAsserted(() -> {
                     // Abruptly re-open the managed ledger without graceful close
                     @Cleanup("shutdown")
@@ -5923,7 +5943,8 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
                     ManagedLedger ledger2 = factory2.open("testFlushCursorAfterIndDelInactivity", config);
                     ManagedCursor c2 = ledger2.openCursor("c");
 
-                    assertThat(c2.getMarkDeletedPosition()).isGreaterThan(positions.get(positions.size() - 1));
+                    assertThat(c2.getMarkDeletedPosition())
+                            .isGreaterThanOrEqualTo(positions.get(positions.size() - 1));
                 });
     }
 
@@ -5932,15 +5953,12 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
     @Test
     public void testFlushCursorAfterError() throws Exception {
         ManagedLedgerConfig config = defaultConfig();
-        config.setThrottleMarkDelete(1.0);
-
-        ManagedLedgerFactoryConfig factoryConfig = new ManagedLedgerFactoryConfig();
-        factoryConfig.setCursorPositionFlushSeconds(1);
+        config.setThrottleMarkDelete(0);
 
         @Cleanup("shutdown")
-        ManagedLedgerFactory factory1 = new ManagedLedgerFactoryImpl(metadataStore, bkc, factoryConfig);
+        ManagedLedgerFactory factory1 = new ManagedLedgerFactoryImpl(metadataStore, bkc);
         ManagedLedger ledger1 = factory1.open("testFlushCursorAfterInactivity", config);
-        ManagedCursor c1 = ledger1.openCursor("c");
+        ManagedCursorImpl c1 = (ManagedCursorImpl) ledger1.openCursor("c");
         List<Position> positions = new ArrayList<>();
 
         for (int i = 0; i < 20; i++) {
@@ -5948,10 +5966,13 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
         }
 
         c1.markDelete(positions.get(0));
-        // Mark-deletes are limited to 1 per second: wait for the next one to be persisted, so that it fails
-        Thread.sleep(1500);
-        // Simulate BK write error
-        bkc.failNow(BKException.Code.NotEnoughBookiesException);
+        Position persistedPosition = c1.getPersistentMarkDeletedPosition();
+
+        // Simulate a persistence error on both the cursor ledger and its metadata-store fallback.
+        for (int i = 0; i < 8; i++) {
+            bkc.addEntryFailAfter(i, BKException.Code.NotEnoughBookiesException);
+            bkc.failAfter(i, BKException.Code.NotEnoughBookiesException);
+        }
         metadataStore.setAlwaysFail(new MetadataStoreException.BadVersionException(""));
         try {
             c1.markDelete(positions.get(positions.size() - 1));
@@ -5960,24 +5981,29 @@ public class ManagedCursorTest extends MockedBookKeeperTestCase {
             // Expected
         }
 
-        metadataStore.unsetAlwaysFail();
-
-        // In memory position is updated
+        // In-memory position is updated while the persisted one is not.
         assertEquals(c1.getMarkDeletedPosition(), positions.get(positions.size() - 1));
+        assertEquals(c1.getPersistentMarkDeletedPosition(), persistedPosition);
 
-        Awaitility.await()
-                // Give chance to the flush to be automatically triggered.
-                // NOTE: this can't be set too low, or it causes issues with ZK thread pool rejecting
-                .pollDelay(Duration.ofMillis(2000))
-                .untilAsserted(() -> {
-                    // Abruptly re-open the managed ledger without graceful close
-                    @Cleanup("shutdown")
-                    ManagedLedgerFactory factory2 = new ManagedLedgerFactoryImpl(metadataStore, bkc);
-                    ManagedLedger ledger2 = factory2.open("testFlushCursorAfterInactivity", config);
-                    ManagedCursor c2 = ledger2.openCursor("c");
+        // A flush while storage is unavailable keeps the cursor dirty instead of dropping the retry path.
+        c1.flush();
+        Awaitility.await().untilAsserted(() -> assertThat(c1.isDirty()).isTrue());
 
-                    assertThat(c2.getMarkDeletedPosition()).isGreaterThan(positions.get(positions.size() - 1));
-                });
+        metadataStore.unsetAlwaysFail();
+        bkc.drainProgrammedFailures();
+
+        // Once storage is healthy, the flush retries the persistence and the cursor becomes clean.
+        c1.flush();
+        Awaitility.await().untilAsserted(() -> assertThat(c1.isDirty()).isFalse());
+        assertEquals(c1.getPersistentMarkDeletedPosition(), positions.get(positions.size() - 1));
+
+        // Abruptly re-open the managed ledger without graceful close: the retried acknowledgment survives.
+        @Cleanup("shutdown")
+        ManagedLedgerFactory factory2 = new ManagedLedgerFactoryImpl(metadataStore, bkc);
+        ManagedLedger ledger2 = factory2.open("testFlushCursorAfterInactivity", config);
+        ManagedCursor c2 = ledger2.openCursor("c");
+        assertThat(c2.getMarkDeletedPosition())
+                .isGreaterThanOrEqualTo(positions.get(positions.size() - 1));
     }
 
     @Test

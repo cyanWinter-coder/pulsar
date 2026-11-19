@@ -22,6 +22,7 @@ import static org.apache.bookkeeper.mledger.ManagedCursor.CURSOR_INTERNAL_PROPER
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
@@ -515,6 +516,42 @@ public class PersistentSubscriptionTest {
 
         verify(cursorMock, never()).asyncMarkDelete(any(), any(), any(), any());
         verify(testDispatcher, never()).markDeletePositionMoveForward();
+    }
+
+    @Test
+    public void testClearBacklogCompletesWhenCursorClearsIt() throws Exception {
+        Dispatcher testDispatcher = mock(Dispatcher.class);
+        persistentSubscription.dispatcher = testDispatcher;
+        doAnswer(invocation -> {
+            invocation.<AsyncCallbacks.ClearBacklogCallback>getArgument(0).clearBacklogComplete(invocation.getArgument(1));
+            return null;
+        }).when(cursorMock).asyncClearBacklog(any(), any());
+
+        persistentSubscription.clearBacklog().get(5, TimeUnit.SECONDS);
+
+        verify(cursorMock).asyncClearBacklog(any(), any());
+        verify(testDispatcher).markDeletePositionMoveForward();
+    }
+
+    @Test
+    public void testClearBacklogFailureIsPropagatedAndSignalsDispatcher() {
+        Dispatcher testDispatcher = mock(Dispatcher.class);
+        persistentSubscription.dispatcher = testDispatcher;
+        // An exception without a cause: the cursor's failure path must not dereference a null cause while
+        // deciding whether the backlog was already cleared by a concurrent operation.
+        ManagedLedgerException failure = new ManagedLedgerException("backlog clear failed");
+        doAnswer(invocation -> {
+            invocation.<AsyncCallbacks.ClearBacklogCallback>getArgument(0)
+                    .clearBacklogFailed(failure, invocation.getArgument(1));
+            return null;
+        }).when(cursorMock).asyncClearBacklog(any(), any());
+
+        assertThat(persistentSubscription.clearBacklog())
+                .failsWithin(5, TimeUnit.SECONDS)
+                .withThrowableOfType(ExecutionException.class)
+                .withCause(failure);
+
+        verify(testDispatcher).afterAckMessages(eq(failure), any());
     }
 
     public static class CustomTransactionPendingAckStoreProvider implements TransactionPendingAckStoreProvider {
